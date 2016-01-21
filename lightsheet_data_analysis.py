@@ -5,6 +5,9 @@ Data analysis of Lightsheet acquisition
 Paper: Long-term engraftment of primary bone marrow stroma promotes hematopoietic reconstitution after transplantation
 Author: Jean-Paul Abbuehl
 
+
+
+
 @author: Jean-Paul Abbuehl
 '''
 # Load depedencies
@@ -26,7 +29,8 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from pandas.tools.plotting import parallel_coordinates
 
 from shapely.affinity import scale
-from shapely.geometry import Point, shape, Polygon
+from shapely.geometry import shape, Polygon
+from shapely.geometry import Point as PT
 from shapely.ops import cascaded_union
 
 from bokeh.plotting import figure, show, output_file
@@ -62,8 +66,9 @@ def run():
     light_correction = True
     remove_duplicate_spot = True
     registration = 'simple'  # simple or icp
+    within_distance = False
     icp_niter = 50
-    save_plot = True  # Save plot instead of showing
+    save_plot = False  # Save plot instead of showing
 
     # Sample specific parameters
     # Gating list specifies the order of gating
@@ -73,20 +78,36 @@ def run():
     # Logic list specifies the constraint for the gating
     # Logic 0 = Strickly negative, Logic 1 = Negative, Logic 2 = Positive,
     # Logic 3 = Strickly positive
-    HSC_gating = [3, 1, 5, 2, 4]
-    HSC_logic = [1, 0, 3, 2, 2]
-    SSC_gating = [3, 2]
-    SSC_logic = [3, 3]
-    PROG_gating = [3, 2]
-    PROG_logic = [3, 1]
+    if sample == 'gfp2a':
+        HSC_gating = [3, 1, 5, 2, 4]
+        HSC_logic = [1, 0, 3, 2, 2]
+        SSC_gating = [3, 2]
+        SSC_logic = [3, 3]
+        PROG_gating = [3, 2]
+        PROG_logic = [3, 1]
+    elif sample == 'gfp3':
+        HSC_gating = [3, 1, 5, 2]
+        HSC_logic = [1, 0, 2, 3]
+        SSC_gating = [3, 2]
+        SSC_logic = [2, 3]
+        PROG_gating = [3, 2]
+        PROG_logic = [3, 1]
+    elif sample == 'gfp4':
+        HSC_gating = [3, 1, 5, 2]
+        HSC_logic = [0, 0, 3, 2]
+        SSC_gating = [3, 2]
+        SSC_logic = [3, 2]
+        PROG_gating = [3, 2]
+        PROG_logic = [3, 0]
 
     # DBscan parameters
     min_samples_per_cluster = 4
     threshold_distance = [40, 200]  # min and high
+    withincluster_distance = 40  # will be overwritten by bin_max if within_distance True
 
     # Cache for loading preprocessed data, if already computed before
-    cache_ROI = False
-    cache_cells = False
+    cache_ROI = True
+    cache_cells = True
 
     # Graphical parameters
     global plot_size, marker_size
@@ -140,7 +161,7 @@ def run():
         PROG_result = np.load(Fsuffix + '.npy')
     else:
         # Loading and correcting data
-        data = DATA_loading(light_correction)
+        data = DATA_loading(light_correction, registration)
         data = ROI_filtering(data, polygon, graph_roi)
         spot_duplicate_tolerance = 5.0  # Maximum distance for duplicate detection
         data = DUPLICATE_remove(
@@ -191,6 +212,67 @@ def run():
     sns.despine()
     sns.plt.show()
 
+    if within_distance:
+        distance0, index0 = DISTANCE_spatial(
+            HSC_result, HSC_result, neighbors=3)
+        np.savetxt("data//" + sample + "//intradistance_HSC_output.csv",
+                   distance0, delimiter=',')
+        df = pd.DataFrame(
+            {'distance': distance0, 'sample': [1] * len(distance0)})
+        sns.set_style("whitegrid")
+        sns.plt.grid(False)
+        p = sns.violinplot(x="sample", y="distance", data=df, palette="Set2",
+                           split=False, scale="area", cut=0, inner="quartile", orient='v')
+
+        # Find most frequent value
+        bin_range = distance0.max() - distance0.min()
+        bin_step = 10.0
+        bin_size = [
+            i * bin_step for i in xrange(int(bin_range // bin_step + 1.0))]
+        bin_size.append(bin_range)
+        bin_hist, bin_size = np.histogram(distance0, bin_size)
+        bin_max = bin_size[np.argmax(bin_hist) + 1]
+        plt.title('Max bin size %d' % bin_max)
+        sns.despine()
+        sns.plt.show()
+        withincluster_distance = bin_max
+
+    result, not_classified = membersDBScan(
+        HSC_result[:, [2, 3]], withincluster_distance, min_samples_per_cluster)
+    close_cluster = np.zeros(len(result), dtype=bool)
+    far_cluster = np.zeros(len(result), dtype=bool)
+    nb_cluster = np.zeros(len(result))
+    for i in xrange(len(result)):
+        HSC_cluster = HSC_result[result[i], :]
+        nb_cluster[i] = len(result[i])
+        distance, index = DISTANCE_spatial(HSC_cluster, SSC_result)
+        if any(distance[:] < threshold_distance[0]):
+            close_cluster[i] = True
+        if any(distance[:] > threshold_distance[1]):
+            far_cluster[i] = True
+    print 'total cluster %d - close cluster %d - far cluster %d' % (len(result), sum(close_cluster), sum(far_cluster))
+    print '%d percentage not classified' % not_classified
+    df = pd.DataFrame(
+        {'cells': nb_cluster, 'close': close_cluster, 'far': far_cluster})
+    df.to_csv("data//" + sample + "//relative_cluster_cell_numbers.csv", sep=',')
+    CLUSTER_plot(df, min_samples_per_cluster,
+                 withincluster_distance, threshold_distance, save_plot)
+
+    # additional test, which proportion of SSC is close to HSC Cluster
+    SSC_distance_to_HSC_cluster = np.zeros(SSC_result.shape[0])
+    for i in xrange(SSC_result.shape[0]):
+        SSC = SSC_result[i:, :]
+        current_loop = np.zeros(len(result))
+        for j in xrange(len(result)):
+            HSC_cluster = HSC_result[result[j], :]
+            distance, index = DISTANCE_spatial(SSC, HSC_cluster)
+            current_loop[j] = distance.min()
+        SSC_distance_to_HSC_cluster[i] = current_loop.min()
+    SSC_C = sum(SSC_distance_to_HSC_cluster < threshold_distance[0])
+    SSC_F = sum(SSC_distance_to_HSC_cluster > threshold_distance[1])
+    SSC_T = SSC_result.shape[0]
+    print 'SSC close to HSC cluster %d - SSC far from HSC cluster %d - total SSC %d' % (SSC_C, SSC_F, SSC_T)
+
     # Extract All ROI with interaction HSC and SSC, not yet implemented
     if ROI_extraction:
         close_mask = distance1 < threshold_distance[0]
@@ -198,24 +280,6 @@ def run():
         coordinates = ROI_definition(SSC_subset)
         diameter = 200.0
         ROI_crop(coordinates, diameter)
-
-    # DBscan clustering
-    distance3, index3 = DISTANCE_spatial(HSC_result, SSC_result)
-    close_mask = distance3 < threshold_distance[0]
-    HSC_close = HSC_result[close_mask, :]
-    far_mask = distance3 > threshold_distance[1]
-    HSC_far = HSC_result[far_mask, :]
-
-    within_cluster_threshold = threshold_distance[0]
-    title1 = 'Clustering of HSC close to SSC - %f' % threshold1
-    ClHSC_close = cDBScan(HSC_close[:, [2, 3]], title1, within_cluster_threshold,
-                          graph_cluster, min_samples_per_cluster, plot_size, marker_size)
-    title2 = 'Clustering of HSC far from SSC - %f' % threshold2
-    ClHSC_far = cDBScan(HSC_far[:, [2, 3]], title2, within_cluster_threshold,
-                        graph_cluster, min_samples_per_cluster, plot_size, marker_size)
-
-    Cluster_plot(ClHSC_close, ClHSC_far, min_samples_per_cluster, threshold_distance, [
-                 HSC_close.shape[0], HSC_far.shape[0]], save_plot)
 
 
 def suffix(gating, logic):
@@ -245,8 +309,13 @@ def ROI_define():
     plt.connect('motion_notify_event', cnv.set_location)
     plt.show()
 
-    # Deal with polygon
+    # Deal with polygon and overlap
     poly = cnv.extract_poly()
+    positionX = np.zeros(poly.shape[0])
+    positionY = np.zeros(poly.shape[0])
+    for i in xrange(poly.shape[0]):
+        positionX[i] = poly[i, 0] // width
+        positionY[i] = poly[i, 1] // height
     poly, scaleX, scaleY = coordinate_conversion(
         poly, im.shape[1], im.shape[0])
     return poly, scaleX, scaleY
@@ -258,7 +327,7 @@ def DUPLICATE_remove(data, distance_threshold, graph=False):
                             [sizeFormat, sizeFormat])
     result = np.zeros(data.shape[0], dtype=bool)
     for i in xrange(data.shape[0]):
-        result[i] = poly.contains(Point(data[i, 2], data[i, 3]))
+        result[i] = poly.contains(PT(data[i, 2], data[i, 3]))
     data_to_evaluate = data[result.ravel(), :]
     output = data[np.invert(result.ravel()), :]
     # Calculate Nearest Neighbors distance
@@ -341,7 +410,8 @@ def ROI_filtering(data, poly, graph):
         width = im.shape[1]
         ROI_plot(data, poly, 'before filtering', 5.0, 5, width, height)
     for i in xrange(data.shape[0]):
-        result[i] = poly.contains(Point(data[i, 2], data[i, 3]))
+        p = PT(data[i, 2], data[i, 3])
+        result[i] = poly.contains(p)
     data = data[result.ravel(), :]
     print str(data.shape[0]) + ' objects after filtering'
     if graph:
@@ -355,6 +425,8 @@ def convertXYforPlot(data, pixelSize, scaleX, scaleY):
     data = data.astype(int)
     return data
 
+# Must take into account registration
+
 
 def coordinate_conversion(data, width, height):
     scaleX = ncol * pixelFormat / width * pixelSize
@@ -363,6 +435,9 @@ def coordinate_conversion(data, width, height):
     Ymap = map(int, data[:, 1].tolist())
     geom = Polygon(zip(Xmap, Ymap))
     geom2 = scale(geom, xfact=scaleX, yfact=scaleY, origin=((0, 0)))
+
+    # Take into account registration
+
     return geom2, scaleX, scaleY
 
 
@@ -507,8 +582,17 @@ def distance_correction(data):
 # Calculate Nearest distance from each point in data1 to any point in data2
 
 
+def unique_rows(a):
+    a = np.ascontiguousarray(a)
+    unique_a = np.unique(a.view([('', a.dtype)] * a.shape[1]))
+    return unique_a.view(a.dtype).reshape((unique_a.shape[0], a.shape[1]))
+
+
 def DISTANCE_spatial(data1, data2, neighbors=1):
-    cloud1 = data1[:, [2, 3, 4]]
+    if data1.ndim == 2:
+        cloud1 = data1[:, [2, 3, 4]]
+    else:
+        cloud1 = data1[[2, 3, 4]]
     cloud2 = data2[:, [2, 3, 4]]
     distance, index = spatial.KDTree(cloud2).query(cloud1, k=neighbors)
     if neighbors > 1:
@@ -645,7 +729,7 @@ def read_views(registration):
 
     # Get all transition
     if 'simple' in registration:
-        Xregister, Yregister = simple_merge(overlap_region)
+        Xregister, Yregister = simple_merge()
     elif 'icp' in registration:
         Xregister, Yregister = icp(overlap_region, icp_niter, graph_icp)
     else:
@@ -900,7 +984,6 @@ def cDBScan(data, title, eps, graph_cluster, min_samples, pltsize, msize):
     core_samples_mask[db.core_sample_indices_] = True
     labels = db.labels_
     n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
-    score = metrics.silhouette_score(data, labels)
 
     if graph_cluster:
         im = mpimg.imread(image)
@@ -948,30 +1031,32 @@ def cDBScan(data, title, eps, graph_cluster, min_samples, pltsize, msize):
     return cluster_size
 
 
-def Cluster_plot(v1, v2, min_bin, min_eps, distances, total_HSC, save_plot):
-    bins = np.linspace(min_bin, max(v1 + v2), int(max(v1 + v2) / 2))
-    # V1 length clusters
-    # V2 length clusters
+def CLUSTER_plot(df, min_eps, within_dist, relative_dist, save_plot):
+    # Define bin size for count histogram
+    bins = np.linspace(min_eps, df['cells'].max(), df[
+                       'cells'].max() - min_eps + 1)
+    total_HSC = df['cells'].sum()
+    close_HSC = df[df['close']].shape[0]
+    far_HSC = df[df['far']].shape[0]
+
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    fig.suptitle('Cluster size: %d total HSC' %
-                 sum(total_HSC), fontsize=14, fontweight='bold')
+    fig.suptitle('%d total HSC that are %d um apart' %
+                 (total_HSC, within_dist), fontsize=14, fontweight='bold')
     info_title = "Close HSC clusters: %d (%d um)   Far HSC cluster: %d (%d um)" % (
-        len(v1), distances[0], len(v2), distances[1])
+        close_HSC, relative_dist[0], far_HSC, relative_dist[1])
     ax.set_title(info_title)
     ax.set_xlabel('Cells per cluster')
     ax.set_ylabel('Nb of cluster')
-    c1 = int(sum(v1) / float(total_HSC[0]) * 100)
-    c2 = int(sum(v2) / float(total_HSC[1]) * 100)
     sns.plt.grid(False)
-    plt.hist(v1, bins, alpha=0.5, label='Close HSC clusters: ' +
-             ' - ' + str(c1) + '%')
-    plt.hist(v2, bins, alpha=0.5, label='Far HSC clusters: ' +
-             ' - ' + str(c2) + '%')
+    v1 = df[df['close']]
+    plt.hist(v1['cells'].tolist(), bins, alpha=0.5, label='Close HSC clusters')
+    v2 = df[df['far']]
+    plt.hist(v2['cells'].tolist(), bins, alpha=0.5, label='Far HSC clusters')
     plt.legend(loc='upper right')
     sns.despine()
     if save_plot:
-        suffix = str(min_bin) + 'pts_' + str(min_eps) + 'perc'
+        suffix = str(min_eps) + 'perc'
         savefig("data//" + sample + "//clustering_" + suffix + ".png")
     else:
         plt.show()
@@ -1075,7 +1160,8 @@ def JVdone():
     VM_KILLED = True
 
 
-def parse_xml_metadata_IDS(xml, array_order=DEFAULT_DIM_ORDER):
+def parse_xml_metadata_IDS(xml):
+    array_order = 'XYZTC'
     root = xml.getroot()
     size_tags = ['Size' + c for c in 'XYZ']
     res_tags = ['PhysicalSize' + c for c in 'XYZ']
@@ -1094,8 +1180,27 @@ def parse_xml_metadata_IDS(xml, array_order=DEFAULT_DIM_ORDER):
     return output
 
 
-def metadata(filename, array_order=DEFAULT_DIM_ORDER):
+def metadata(filename):
+    array_order = 'XYZTC'
     md_string = bf.get_omexml_metadata(filename)
     return parse_xml_metadata(md_string, array_order)
+
+
+def membersDBScan(data, eps, min_samples):
+    #data = unique_rows(data)
+    # No normalization, because it distort distances
+    db = DBSCAN(eps, min_samples).fit(data)
+    core_samples_mask = np.zeros_like(db.labels_, dtype=bool)
+    # Determine which cells were clustered
+    core_samples_mask[db.core_sample_indices_] = True
+    labels = db.labels_
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    cluster_members = []
+    not_classified = np.where(labels == -1)[0].tolist()
+    percentage = float(len(not_classified)) / float(data.shape[0]) * 100.0
+    print 'percentage HSC not classified %f' % percentage
+    for i in xrange(n_clusters):
+        cluster_members.append(np.where(labels == i)[0].tolist())
+    return cluster_members, percentage
 
 run()
